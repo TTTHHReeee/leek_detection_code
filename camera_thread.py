@@ -120,12 +120,12 @@ class CameraThread(QThread):
                         conf = result.obb.conf[i].item()
 
                         if cls_id == 0:
-                            color = (0, 255, 0)
-                            white_list.append((pts, conf))
-                            display_name = "leek_root"
-                        elif cls_id == 1:
                             color = (0, 0, 255)
                             root_list.append((pts, conf))
+                            display_name = "leek_root"
+                        elif cls_id == 1:
+                            color = (0, 255, 0)
+                            white_list.append((pts, conf))
                             display_name = "leek_white"
                         else:
                             color = (255, 255, 0)
@@ -137,13 +137,69 @@ class CameraThread(QThread):
                         cv2.putText(result_image, f"{display_name} {conf:.2f}", (text_x, text_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # === 简单统计数量 (已去除物理距离匹配逻辑) ===
-                root_count = len(white_list)
-                white_count = len(root_list) # 画面里总的根数量
+                # === 全局贪心距离匹配算法 ===
+                white_count = len(white_list)
+                root_count = len(root_list)
+                uncut_leeks = 0
+                DISTANCE_THRESHOLD = 50.0  # 像素距离阈值
+
+                if white_count > 0 and root_count > 0:
+                    # 1. 提取葱白底部中心和葱须顶部中心，以及整体中心点
+                    w_anchors = []
+                    w_centers = []
+                    for pts, _ in white_list:
+                        w_bottom = pts[np.argsort(pts[:, 1])][2:] # 取y最大(最底)的两个点
+                        w_anchors.append(w_bottom.mean(axis=0))
+                        w_centers.append(pts.mean(axis=0))
+                    
+                    r_anchors = []
+                    r_centers = []
+                    for pts, _ in root_list:
+                        r_top = pts[np.argsort(pts[:, 1])][:2]    # 取y最小(最顶)的两个点
+                        r_anchors.append(r_top.mean(axis=0))
+                        r_centers.append(pts.mean(axis=0))
+                    
+                    w_anchors = np.array(w_anchors)
+                    r_anchors = np.array(r_anchors)
+                    w_centers = np.array(w_centers)
+                    r_centers = np.array(r_centers)
+
+                    # 2. 计算距离矩阵 (W x R)
+                    diff = w_anchors[:, np.newaxis, :] - r_anchors[np.newaxis, :, :]
+                    dist_matrix = np.linalg.norm(diff, axis=2)
+
+                    # 3. 全局贪心匹配
+                    # 将距离矩阵展平，并获取升序索引
+                    flat_indices = np.argsort(dist_matrix, axis=None)
+                    
+                    matched_w = set()
+                    matched_r = set()
+
+                    for idx in flat_indices:
+                        w_idx, r_idx = np.unravel_index(idx, dist_matrix.shape)
+                        
+                        if w_idx in matched_w or r_idx in matched_r:
+                            continue
+                            
+                        min_dist = dist_matrix[w_idx, r_idx]
+                        if min_dist < DISTANCE_THRESHOLD:
+                            # 匹配成功
+                            matched_w.add(w_idx)
+                            matched_r.add(r_idx)
+                            uncut_leeks += 1
+                            
+                            # 在真实画面中画出匹配连线，连接两个框的中心点
+                            ptw = tuple(w_centers[w_idx].astype(int))
+                            ptr = tuple(r_centers[r_idx].astype(int))
+                            cv2.line(result_image, ptw, ptr, (255, 0, 255), 3)
+                            cv2.circle(result_image, ptw, 4, (0, 255, 0), -1)
+                            cv2.circle(result_image, ptr, 4, (0, 0, 255), -1)
+                        else:
+                            # 由于距离已经排过序，当前最小距离已大于阈值，后续无需继续比较
+                            break
                 
-                # 直接通过全局葱白与葱须数量计算成功切除的数量
-                # 注意：这种方式在有多根葱时计算较为粗糙，由用户要求恢复。
-                cut_ok = max(0, white_count - root_count)
+                # 成功的 = 总发现的葱白体 - 未切除带根的葱白体
+                cut_ok = max(0, white_count - uncut_leeks)
                 
                 # 发送信号更新 UI
                 self.update_data_signal.emit(white_count, root_count, cut_ok)
@@ -215,52 +271,64 @@ class CameraThread(QThread):
                             cv2.polylines(result_image, [pts], True, (0, 0, 255), 2)
                             cv2.putText(result_image, f"root {conf:.2f}", (int(pts[0][0]), int(pts[0][1]-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
-                # 第二步：空间距离匹配 (Instance Association) 顶点版本
+                # 第二步：基于中心点的全局贪心匹配 (快速且高效)
                 white_count = len(white_list)
                 root_count = len(root_list) # 画面里总的根数量（包含废料）
-                matched_roots = set()
                 uncut_leeks = 0  # 绑定成功的未切葱
                 
-                DISTANCE_THRESHOLD = 50.0  # 顶点匹配距离阈值
+                DISTANCE_THRESHOLD = 50.0  # 距离阈值
                 
-                for w_pts, w_conf in white_list:
-                    best_dist = float('inf')
-                    best_r_idx = -1
-                    best_w_pt = None
-                    best_r_pt = None
+                if white_count > 0 and root_count > 0:
+                    # 1. 提取葱白底端中心和葱须顶端中心点，以及整体中心点
+                    w_anchors = []
+                    w_centers = []
+                    for pts, _ in white_list:
+                        w_bottom = pts[np.argsort(pts[:, 1])][2:]
+                        w_anchors.append(w_bottom.mean(axis=0))
+                        w_centers.append(pts.mean(axis=0))
+                        
+                    r_anchors = []
+                    r_centers = []
+                    for pts, _ in root_list:
+                        r_top = pts[np.argsort(pts[:, 1])][:2]
+                        r_anchors.append(r_top.mean(axis=0))
+                        r_centers.append(pts.mean(axis=0))
+                        
+                    w_anchors = np.array(w_anchors)
+                    r_anchors = np.array(r_anchors)
+                    w_centers = np.array(w_centers)
+                    r_centers = np.array(r_centers)
                     
-                    # 按照 y 坐标对葱白的 4 个顶点排序，取 y 最大（最下）的两个点作为葱白底端顶点
-                    w_pts_sorted = w_pts[np.argsort(w_pts[:, 1])]
-                    w_bottom_pts = w_pts_sorted[2:]
+                    # 2. 计算距离矩阵 (W x R)
+                    diff = w_anchors[:, np.newaxis, :] - r_anchors[np.newaxis, :, :]
+                    dist_matrix = np.linalg.norm(diff, axis=2)
                     
-                    for r_idx, (r_pts, r_conf) in enumerate(root_list):
-                        if r_idx in matched_roots: continue
+                    # 3. 排序所有距离进行全局贪心匹配
+                    flat_indices = np.argsort(dist_matrix, axis=None)
+                    
+                    matched_w = set()
+                    matched_r = set()
+                    
+                    for idx in flat_indices:
+                        w_idx, r_idx = np.unravel_index(idx, dist_matrix.shape)
                         
-                        # 按照 y 坐标对葱须的 4 个顶点排序，取 y 最小（最上）的两个点作为葱须顶端顶点
-                        r_pts_sorted = r_pts[np.argsort(r_pts[:, 1])]
-                        r_top_pts = r_pts_sorted[:2]
-                        
-                        # 仅计算葱白底部和葱须顶部顶点(2x2)两两之间的最小欧氏距离
-                        diff = w_bottom_pts[:, np.newaxis, :] - r_top_pts[np.newaxis, :, :]
-                        dist_matrix = np.linalg.norm(diff, axis=2)
-                        min_dist = np.min(dist_matrix)
-                        
-                        if min_dist < DISTANCE_THRESHOLD and min_dist < best_dist:
-                            best_dist = min_dist
-                            best_r_idx = r_idx
-                            min_w_idx, min_r_idx = np.unravel_index(np.argmin(dist_matrix), dist_matrix.shape)
-                            best_w_pt = (int(w_bottom_pts[min_w_idx][0]), int(w_bottom_pts[min_w_idx][1]))
-                            best_r_pt = (int(r_top_pts[min_r_idx][0]), int(r_top_pts[min_r_idx][1]))
+                        if w_idx in matched_w or r_idx in matched_r:
+                            continue
                             
-                    if best_r_idx != -1:
-                        # 匹配成功！说明这是一根带根的葱 (未切除)
-                        matched_roots.add(best_r_idx)
-                        uncut_leeks += 1
-                        
-                        # 画一条紫色的线连接最近的两个顶点
-                        cv2.line(result_image, best_w_pt, best_r_pt, (255, 0, 255), 3)
-                        cv2.circle(result_image, best_w_pt, 4, (0, 255, 0), -1)
-                        cv2.circle(result_image, best_r_pt, 4, (0, 0, 255), -1)
+                        min_dist = dist_matrix[w_idx, r_idx]
+                        if min_dist < DISTANCE_THRESHOLD:
+                            matched_w.add(w_idx)
+                            matched_r.add(r_idx)
+                            uncut_leeks += 1
+                            
+                            # 画一条紫色的线连接中心点
+                            pt1 = tuple(w_centers[w_idx].astype(int))
+                            pt2 = tuple(r_centers[r_idx].astype(int))
+                            cv2.line(result_image, pt1, pt2, (255, 0, 255), 3)
+                            cv2.circle(result_image, pt1, 4, (0, 255, 0), -1)
+                            cv2.circle(result_image, pt2, 4, (0, 0, 255), -1)
+                        else:
+                            break
 
                 # 最终真实数据计算：
                 # 成功的 = 总发现的葱白体 - 未切除带根的葱白体
